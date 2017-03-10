@@ -30,6 +30,11 @@
 #include <libfreenect2/logging.h>
 #include <turbojpeg.h>
 
+#include<iostream>
+#include<fstream>
+
+using namespace std;
+
 namespace libfreenect2
 {
 
@@ -41,6 +46,9 @@ public:
   tjhandle decompressor;
 
   Frame *frame;
+  int BGRX_image[1920*1080*4];
+  double mean_image[1920*1080*3];
+  int accumulate_frames;
 
   TurboJpegRgbPacketProcessorImpl()
   {
@@ -51,6 +59,10 @@ public:
     }
 
     newFrame();
+    accumulate_frames = 0;
+    for (int i = 0; i < 1920*1080*4; i++){
+    	BGRX_image[i] = 0;
+    }
   }
 
   ~TurboJpegRgbPacketProcessorImpl()
@@ -67,6 +79,37 @@ public:
   void newFrame()
   {
     frame = new Frame(1920, 1080, tjPixelSize[TJPF_BGRX]);
+  }
+  
+  void accumulate(){
+	  for (int i=0; i<1920*1080*4; i++){
+		  BGRX_image[i] += frame->data[i];
+	  }
+	  ++accumulate_frames;
+  }
+  
+  void try_save_image(){
+	  if (accumulate_frames % 600 == 0){
+		  cout << "RGB Frames: " << accumulate_frames << endl;
+		  
+		  ofstream fout;
+		  fout.open("RGB_camera.dat", ios::out | ios::binary | ios::trunc);
+		  if(!fout){
+			  cout << "ERROR: Cannot create " << "RGB_camera.dat" << endl;
+			  return;
+		  }
+		  for (int i=0; i<1920*1080; i++){
+			  // Calculate mean value
+			  mean_image[i*3+0] = ((double) BGRX_image[i*4+0]) / (double) accumulate_frames;
+			  mean_image[i*3+1] = ((double) BGRX_image[i*4+1]) / (double) accumulate_frames;
+			  mean_image[i*3+2] = ((double) BGRX_image[i*4+2]) / (double) accumulate_frames;
+			  // Write B, G, R values.
+			  fout.write((char*) &mean_image[i*3+0], sizeof(double));
+			  fout.write((char*) &mean_image[i*3+1], sizeof(double));
+			  fout.write((char*) &mean_image[i*3+2], sizeof(double));
+		  }
+		  fout.close();
+	  }
   }
 };
 
@@ -93,7 +136,9 @@ void TurboJpegRgbPacketProcessor::process(const RgbPacket &packet)
     impl_->frame->gamma = packet.gamma;
 
     int r = tjDecompress2(impl_->decompressor, packet.jpeg_buffer, packet.jpeg_buffer_length, impl_->frame->data, 1920, 1920 * tjPixelSize[TJPF_BGRX], 1080, TJPF_BGRX, 0);
-
+    impl_->accumulate();
+    impl_->try_save_image();
+    
     if(r == 0)
     {
       if(listener_->onNewFrame(Frame::Color, impl_->frame))

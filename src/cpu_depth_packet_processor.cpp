@@ -31,6 +31,7 @@
 #include <libfreenect2/protocol/response.h>
 #include <libfreenect2/logging.h>
 
+#include <iostream>
 #include <fstream>
 
 #include <limits>
@@ -41,6 +42,7 @@
 #include <cmath>
 #include <limits>
 
+using namespace std;
 /**
  * Vector class.
  * @tparam ScalarT Type of the elements.
@@ -278,6 +280,18 @@ public:
   float trig_table0[512*424][6];
   float trig_table1[512*424][6];
   float trig_table2[512*424][6];
+  int raw_image0[512*424][3];
+  int raw_image1[512*424][3];
+  int raw_image2[512*424][3];
+  double abA_image0[512*424][3]; // a_image, b_image, amplitude;
+  double abA_image1[512*424][3]; // a_image, b_image, amplitude;
+  double abA_image2[512*424][3]; // a_image, b_image, amplitude;
+  double phase_image[512*424][4]; // phase: freq0, 1, 2, and final (combined).
+  double ir_amp_image[512*424][4]; // ir amplitude, may be bilateral filtered
+  double depth_image[512*424][2];
+  double tmp_image[512*424];
+  
+  int accumulate_frames;
 
   bool enable_bilateral_filter, enable_edge_filter;
   DepthPacketProcessor::Parameters params;
@@ -295,6 +309,17 @@ public:
     enable_edge_filter = true;
 
     flip_ptables = true;
+    
+    // initialize buffers
+    accumulate_frames = 0;
+    for (int i = 0; i < 512*424; i++){
+    	raw_image0[i][0] = raw_image0[i][1] = raw_image0[i][2] = 0;
+    	raw_image1[i][0] = raw_image1[i][1] = raw_image1[i][2] = 0;
+    	raw_image2[i][0] = raw_image2[i][1] = raw_image2[i][2] = 0;
+    	abA_image0[i][0] = abA_image0[i][1] = abA_image0[i][2] = 0;
+    	abA_image1[i][0] = abA_image1[i][1] = abA_image1[i][2] = 0;
+    	abA_image2[i][0] = abA_image2[i][1] = abA_image2[i][2] = 0;
+    }
   }
 
   /** Allocate a new IR frame. */
@@ -450,6 +475,75 @@ public:
     m_out[0] = tmp3; // ir image a
     m_out[1] = tmp4; // ir image b
     m_out[2] = tmp5; // ir amplitude
+    
+  }
+
+  /**
+   * Process measurement (all three layers).
+   * @param [in] trig_table Trigonometry tables.
+   * @param abMultiplierPerFrq Multiplier.
+   * @param x X position in the image.
+   * @param y Y position in the image.
+   * @param m Measurement.
+   * @param [out] m_out Processed measurement (IR a, IR b, IR amplitude).
+   */
+  void processMeasurementTriple(float trig_table[512*424][6], float abMultiplierPerFrq, int x, int y, const int32_t* m, float* m_out, int layer)
+  {
+    int offset = y * 512 + x;
+    float cos_tmp0 = trig_table[offset][0];
+    float cos_tmp1 = trig_table[offset][1];
+    float cos_tmp2 = trig_table[offset][2];
+
+    float sin_negtmp0 = trig_table[offset][3];
+    float sin_negtmp1 = trig_table[offset][4];
+    float sin_negtmp2 = trig_table[offset][5];
+
+    float zmultiplier = z_table.at(y, x);
+    bool cond0 = 0 < zmultiplier;
+    bool cond1 = (m[0] == 32767 || m[1] == 32767 || m[2] == 32767) && cond0;
+
+    // formula given in Patent US 8,587,771 B2
+    float tmp3 = cos_tmp0 * m[0] + cos_tmp1 * m[1] + cos_tmp2 * m[2];
+    float tmp4 = sin_negtmp0 * m[0] + sin_negtmp1 * m[1] + sin_negtmp2 * m[2];
+
+    // only if modeMask & 32 != 0;
+    if(true)//(modeMask & 32) != 0)
+    {
+        tmp3 *= abMultiplierPerFrq;
+        tmp4 *= abMultiplierPerFrq;
+    }
+    float tmp5 = std::sqrt(tmp3 * tmp3 + tmp4 * tmp4) * params.ab_multiplier;
+
+    // invalid pixel because zmultiplier < 0 ??
+    tmp3 = cond0 ? tmp3 : 0;
+    tmp4 = cond0 ? tmp4 : 0;
+    tmp5 = cond0 ? tmp5 : 0;
+
+    // invalid pixel because saturated?
+    tmp3 = !cond1 ? tmp3 : 0;
+    tmp4 = !cond1 ? tmp4 : 0;
+    tmp5 = !cond1 ? tmp5 : 65535.0; // some kind of norm calculated from tmp3 and tmp4
+
+    m_out[0] = tmp3; // ir image a
+    m_out[1] = tmp4; // ir image b
+    m_out[2] = tmp5; // ir amplitude
+    
+    // Store a-image, b-image, amplitude
+    if (layer==0){
+    	abA_image0[x*424+y][0] = tmp3; // a
+    	abA_image0[x*424+y][1] = tmp4; // b
+    	abA_image0[x*424+y][2] = tmp5; // amplitude
+    }
+    else if (layer==1){
+    	abA_image1[x*424+y][0] = tmp3; // a
+    	abA_image1[x*424+y][1] = tmp4; // b
+    	abA_image1[x*424+y][2] = tmp5; // amplitude
+    }
+    else if (layer==2){
+    	abA_image2[x*424+y][0] = tmp3; // a
+    	abA_image2[x*424+y][1] = tmp4; // b
+    	abA_image2[x*424+y][2] = tmp5; // amplitude
+    }
   }
 
   /**
@@ -490,10 +584,38 @@ public:
     m2_raw[0] = decodePixelMeasurement(data, 6, x, y);
     m2_raw[1] = decodePixelMeasurement(data, 7, x, y);
     m2_raw[2] = decodePixelMeasurement(data, 8, x, y);
-
+    
+    // Store raw images, 512*424
+    raw_image0[x*424+y][0] += m0_raw[0];
+    raw_image0[x*424+y][1] += m0_raw[1];
+    raw_image0[x*424+y][2] += m0_raw[2];
+    raw_image1[x*424+y][0] += m1_raw[0];
+    raw_image1[x*424+y][1] += m1_raw[1];
+    raw_image1[x*424+y][2] += m1_raw[2];
+    raw_image2[x*424+y][0] += m2_raw[0];
+    raw_image2[x*424+y][1] += m2_raw[1];
+    raw_image2[x*424+y][2] += m2_raw[2];
+//
+//    processMeasurementTriple(trig_table0, params.ab_multiplier_per_frq[0], x, y, m0_raw, m0_out, 0);
+//    processMeasurementTriple(trig_table1, params.ab_multiplier_per_frq[1], x, y, m1_raw, m1_out, 1);
+//    processMeasurementTriple(trig_table2, params.ab_multiplier_per_frq[2], x, y, m2_raw, m2_out, 2);
+    
     processMeasurementTriple(trig_table0, params.ab_multiplier_per_frq[0], x, y, m0_raw, m0_out);
     processMeasurementTriple(trig_table1, params.ab_multiplier_per_frq[1], x, y, m1_raw, m1_out);
     processMeasurementTriple(trig_table2, params.ab_multiplier_per_frq[2], x, y, m2_raw, m2_out);
+
+//    // abA images are added at filterPixelStage1.
+//    abA_image0[x*424+y][0] = m0_out[0]; // a
+//    abA_image0[x*424+y][1] = m0_out[1]; // b
+//    abA_image0[x*424+y][2] = m0_out[2]; // amplitude
+//    abA_image1[x*424+y][0] = m1_out[0]; // a
+//    abA_image1[x*424+y][1] = m1_out[1]; // b
+//    abA_image1[x*424+y][2] = m1_out[2]; // amplitude
+//    abA_image2[x*424+y][0] = m2_out[0]; // a
+//    abA_image2[x*424+y][1] = m2_out[1]; // b
+//    abA_image2[x*424+y][2] = m2_out[2]; // amplitude*/
+//    
+
   }
 
   /**
@@ -592,6 +714,24 @@ public:
         m_out[0] = 0.0f < weight_acc ? weighted_m_acc[0] / weight_acc : 0.0f;
         m_out[1] = 0.0f < weight_acc ? weighted_m_acc[1] / weight_acc : 0.0f;
         m_out[2] = m_ptr[2];
+        
+        // Store a-image, b-image, amplitude
+
+        if (i==0){
+        	abA_image0[x*424+y][0] += m_out[0]; // a
+        	abA_image0[x*424+y][1] += m_out[1]; // b
+        	abA_image0[x*424+y][2] += m_out[2]; // amplitude
+        }
+        else if (i==1){
+        	abA_image1[x*424+y][0] += m_out[0]; // a
+        	abA_image1[x*424+y][1] += m_out[1]; // b
+        	abA_image1[x*424+y][2] += m_out[2]; // amplitude
+        }
+        else if (i==2){
+        	abA_image2[x*424+y][0] += m_out[0]; // a
+        	abA_image2[x*424+y][1] += m_out[1]; // b
+        	abA_image2[x*424+y][2] += m_out[2]; // amplitude
+        }
       }
     }
   }
@@ -610,6 +750,12 @@ public:
     transformMeasurements(m0);
     transformMeasurements(m1);
     transformMeasurements(m2);
+    phase_image[x*424 + y][0] += m0[0];
+    phase_image[x*424 + y][1] += m1[0];
+    phase_image[x*424 + y][2] += m2[0];
+    ir_amp_image[x*424 + y][0] += m0[1];
+    ir_amp_image[x*424 + y][1] += m1[1];
+    ir_amp_image[x*424 + y][2] += m2[1];
 
     float ir_sum = m0[1] + m1[1] + m2[1];
 
@@ -739,6 +885,10 @@ public:
     //ir_out[0] = std::min(m0[2] * ab_output_multiplier, 65535.0f);
     //ir_out[1] = std::min(m1[2] * ab_output_multiplier, 65535.0f);
     //ir_out[2] = std::min(m2[2] * ab_output_multiplier, 65535.0f);
+    
+    phase_image[x*424+y][3] += phase;
+    ir_amp_image[x*424+y][3] += ir_sum;
+    depth_image[x*424+y][0] += depth;
   }
 
   void filterPixelStage2(int x, int y, Mat<Vec<float, 3> > &m, bool max_edge_test_ok, float *depth_out)
@@ -819,6 +969,99 @@ public:
 
     // override raw depth
     depth_and_ir_sum.val[0] = depth_and_ir_sum.val[1];
+    
+    depth_image[x*424+y][1] += *depth_out;
+  }
+  
+  void save_image(const char* filename){
+	  ofstream fout;
+	  fout.open(filename, ios::out | ios::binary | ios::trunc);
+	  if(!fout){
+		  cout << "ERROR: Cannot create " << filename << endl;
+		  return;
+	  }
+	  for (int i=0; i<512*424; i++){
+		  fout.write((char*) &tmp_image[i], sizeof(double));
+	  }
+	  fout.close();
+  }
+  
+  void save_image(const char*filename, int*data, int offset, int skip){	  
+//	  ofstream fout;
+//	  fout.open(filename, ios::out | ios::binary | ios::trunc);
+//	  if(!fout){
+//		  cout << "ERROR: Cannot create " << filename << endl;
+//		  return;
+//	  }
+//	  for (int i=0; i<512*424; i++){
+//		  fout.write((char*) &data[i*skip+offset], sizeof(int));
+//	  }
+//	  fout.close();
+	  for (int i=0; i<512*424; i++){
+		  tmp_image[i] = ((double)data[i*skip+offset]) / (double) accumulate_frames;
+	  }
+	  save_image(filename);
+  }
+  void save_image(const char*filename, double*data, int offset, int skip){	  
+//	  ofstream fout;
+//	  fout.open(filename, ios::out | ios::binary | ios::trunc);
+//	  if(!fout){
+//		  cout << "ERROR: Cannot create " << filename << endl;
+//		  return;
+//	  }
+//	  for (int i=0; i<512*424; i++){
+//		  fout.write((char*) &data[i*skip+offset], sizeof(double));
+//	  }
+//	  fout.close();
+	  for (int i=0; i<512*424; i++){
+		  tmp_image[i] = data[i*skip+offset] / (double) accumulate_frames;
+	  }
+	  save_image(filename);
+  }
+  
+  
+  void save_all_images(){
+	  if (accumulate_frames++ % 80 > 0){
+		  // cout << "  Save skipped." << endl;
+		  return;
+	  }
+	  cout << "Frames: " << accumulate_frames << endl;
+	  
+	  /* skip unused images. When other images are needed, uncomment this block.
+	  // Each image requires about 1.7MB storage.
+	  save_image("raw0.dat", (int*)raw_image0, 0, 3);
+	  save_image("raw1.dat", (int*)raw_image0, 1, 3);
+	  save_image("raw2.dat", (int*)raw_image0, 2, 3);
+	  save_image("raw3.dat", (int*)raw_image1, 0, 3);
+	  save_image("raw4.dat", (int*)raw_image1, 1, 3);
+	  save_image("raw5.dat", (int*)raw_image1, 2, 3);
+	  save_image("raw6.dat", (int*)raw_image2, 0, 3);
+	  save_image("raw7.dat", (int*)raw_image2, 1, 3);
+	  save_image("raw8.dat", (int*)raw_image2, 2, 3);
+	  
+	  save_image("phase_a0.dat", (double*)abA_image0, 0, 3);
+	  save_image("phase_b0.dat", (double*)abA_image0, 1, 3);
+	  save_image("amplitude0.dat", (double*)abA_image0, 2, 3);
+	  save_image("phase_a1.dat", (double*)abA_image1, 0, 3);
+	  save_image("phase_b1.dat", (double*)abA_image1, 1, 3);
+	  save_image("amplitude1.dat", (double*)abA_image1, 2, 3);
+	  save_image("phase_a2.dat", (double*)abA_image2, 0, 3);
+	  save_image("phase_b2.dat", (double*)abA_image2, 1, 3);
+	  save_image("amplitude2.dat", (double*)abA_image2, 2, 3);
+	  // */
+	  
+	  save_image("phase0.dat", (double*)phase_image, 0, 4);
+	  save_image("phase1.dat", (double*)phase_image, 1, 4);
+	  save_image("phase2.dat", (double*)phase_image, 2, 4);
+	  save_image("phase_full.dat", (double*)phase_image, 3, 4);
+	  save_image("f_amplitude0.dat", (double*)ir_amp_image, 0, 4);
+	  save_image("f_amplitude1.dat", (double*)ir_amp_image, 1, 4);
+	  save_image("f_amplitude2.dat", (double*)ir_amp_image, 2, 4);
+	  save_image("f_amplitude_full.dat", (double*)ir_amp_image, 3, 4);
+	  
+	  //save_image("depth_raw.dat", (double*)depth_image, 0, 2);
+	  save_image("depth_out.dat", (double*)depth_image, 1, 2);
+	  
   }
 };
 
@@ -891,6 +1134,7 @@ void CpuDepthPacketProcessor::loadLookupTable(const short *lut)
   std::copy(lut, lut + LUT_SIZE, impl_->lut11to16);
 }
 
+
 /**
  * Process a packet.
  * @param packet Packet to process.
@@ -919,7 +1163,8 @@ void CpuDepthPacketProcessor::process(const DepthPacket &packet)
     {
       impl_->processPixelStage1(x, y, packet.buffer, m_ptr + 0, m_ptr + 3, m_ptr + 6);
     }
-
+  
+  
   // bilateral filtering
   if(impl_->enable_bilateral_filter)
   {
@@ -978,6 +1223,8 @@ void CpuDepthPacketProcessor::process(const DepthPacket &packet)
       }
   }
 
+  // Save 9 raw images, 3 a images, 3 b images, and 3 amplitude images.
+  impl_->save_all_images();
   impl_->stopTiming(LOG_INFO);
 
   if (listener_ != 0 ){
