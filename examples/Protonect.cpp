@@ -128,7 +128,8 @@ int main(int argc, char *argv[])
 #else
   // create a console logger with debug level (default is console logger with info level)
 /// [logging]
-  libfreenect2::setGlobalLogger(libfreenect2::createConsoleLogger(libfreenect2::Logger::Debug));
+  //libfreenect2::setGlobalLogger(libfreenect2::createConsoleLogger(libfreenect2::Logger::Debug));
+  libfreenect2::setGlobalLogger(libfreenect2::createConsoleLogger(libfreenect2::Logger::Info));
 /// [logging]
 #endif
 /// [file logging]
@@ -268,9 +269,11 @@ int main(int argc, char *argv[])
     framecount++;
     if (!viewer_enabled)
     {
-      if (framecount % 100 == 0)
+      if (framecount % 10 == 0)
         std::cout << "The viewer is turned off. Received " << framecount << " frames. Ctrl-C to stop." << std::endl;
       listener.release(frames);
+      if (framecount % 100 == 0)
+    	  break;
       continue;
     }
 

@@ -31,6 +31,7 @@
 #include <libfreenect2/protocol/response.h>
 #include <libfreenect2/logging.h>
 
+#include <iostream>
 #include <fstream>
 
 #include <limits>
@@ -41,6 +42,15 @@
 #include <cmath>
 #include <limits>
 
+#ifdef _OPENMP
+#include <omp.h>
+//#include <chrono>
+#include <unistd.h>
+//using namespace std::literals;
+//using namespace std::chrono;
+#endif 
+
+using namespace std;
 /**
  * Vector class.
  * @tparam ScalarT Type of the elements.
@@ -274,10 +284,51 @@ public:
   Mat<float> x_table, z_table;
 
   int16_t lut11to16[2048];
-
   float trig_table0[512*424][6];
   float trig_table1[512*424][6];
   float trig_table2[512*424][6];
+
+  const float reset_depth_far = 2000.;
+  const float reset_depth_near = -1;
+  const float start_depth = 600.;
+  const float end_depth = 1200.; // max 1250mm (2PI limit of 120MHz)
+  const float depth_resolution = 3;
+  //(int) (end_depth - start_depth) / depth_resolution;
+  // from 500 to 1200 by .25, it's 2800.
+  // from 600 to 1200 by .25, it's 2400,
+  // from 600 to 1200 by 1., = 600
+  // from 600 to 1200 by 3., = 600
+#define NUM_DEPTH_BINS 200
+  const int num_of_depth_bins = NUM_DEPTH_BINS; 
+
+//#define SAVE_AMPLITUDE
+
+  const int roi_x = 246;
+  const int roi_y = 202;
+  const int roi_w = 20;
+  const int roi_h = 20;
+  
+  double phase_data_d[NUM_DEPTH_BINS][3];
+  double amp_data_d[NUM_DEPTH_BINS][3];
+  double accumulate_data_d[NUM_DEPTH_BINS];
+  double depth_data_d[NUM_DEPTH_BINS];
+  double temp_data_d[NUM_DEPTH_BINS];
+
+  
+  /*
+  int raw_image0[512*424][3];
+  int raw_image1[512*424][3];
+  int raw_image2[512*424][3];
+  double abA_image0[512*424][3]; // a_image, b_image, amplitude;
+  double abA_image1[512*424][3]; // a_image, b_image, amplitude;
+  double abA_image2[512*424][3]; // a_image, b_image, amplitude;
+  // */
+  double phase_image[512*424][4]; // phase: freq0, 1, 2, and final (combined).
+  double ir_amp_image[512*424][4]; // ir amplitude, may be bilateral filtered
+  double depth_image[512*424][2];
+  double tmp_image[512*424];
+  
+  int accumulate_frames;
 
   bool enable_bilateral_filter, enable_edge_filter;
   DepthPacketProcessor::Parameters params;
@@ -295,6 +346,24 @@ public:
     enable_edge_filter = true;
 
     flip_ptables = true;
+    
+    // initialize buffers
+    accumulate_frames = 0;
+    /*
+    for (int i = 0; i < 512*424; i++){
+    	raw_image0[i][0] = raw_image0[i][1] = raw_image0[i][2] = 0;
+    	raw_image1[i][0] = raw_image1[i][1] = raw_image1[i][2] = 0;
+    	raw_image2[i][0] = raw_image2[i][1] = raw_image2[i][2] = 0;
+    	abA_image0[i][0] = abA_image0[i][1] = abA_image0[i][2] = 0;
+    	abA_image1[i][0] = abA_image1[i][1] = abA_image1[i][2] = 0;
+    	abA_image2[i][0] = abA_image2[i][1] = abA_image2[i][2] = 0;
+    } // */
+    for (int i=0; i < num_of_depth_bins; i++){
+    	phase_data_d[i][0] = phase_data_d[i][1] = phase_data_d[i][2] = 0;
+    	amp_data_d[i][0] = amp_data_d[i][1] = amp_data_d[i][2] = 0;
+    	accumulate_data_d[i] = 0;
+    	depth_data_d[i] = start_depth + depth_resolution * i;
+    }
   }
 
   /** Allocate a new IR frame. */
@@ -450,6 +519,77 @@ public:
     m_out[0] = tmp3; // ir image a
     m_out[1] = tmp4; // ir image b
     m_out[2] = tmp5; // ir amplitude
+    
+  }
+
+  /**
+   * Process measurement (all three layers).
+   * @param [in] trig_table Trigonometry tables.
+   * @param abMultiplierPerFrq Multiplier.
+   * @param x X position in the image.
+   * @param y Y position in the image.
+   * @param m Measurement.
+   * @param [out] m_out Processed measurement (IR a, IR b, IR amplitude).
+   */
+  void processMeasurementTriple(float trig_table[512*424][6], float abMultiplierPerFrq, int x, int y, const int32_t* m, float* m_out, int layer)
+  {
+    int offset = y * 512 + x;
+    float cos_tmp0 = trig_table[offset][0];
+    float cos_tmp1 = trig_table[offset][1];
+    float cos_tmp2 = trig_table[offset][2];
+
+    float sin_negtmp0 = trig_table[offset][3];
+    float sin_negtmp1 = trig_table[offset][4];
+    float sin_negtmp2 = trig_table[offset][5];
+
+    float zmultiplier = z_table.at(y, x);
+    bool cond0 = 0 < zmultiplier;
+    bool cond1 = (m[0] == 32767 || m[1] == 32767 || m[2] == 32767) && cond0;
+
+    // formula given in Patent US 8,587,771 B2
+    float tmp3 = cos_tmp0 * m[0] + cos_tmp1 * m[1] + cos_tmp2 * m[2];
+    float tmp4 = sin_negtmp0 * m[0] + sin_negtmp1 * m[1] + sin_negtmp2 * m[2];
+
+    // only if modeMask & 32 != 0;
+    if(true)//(modeMask & 32) != 0)
+    {
+        tmp3 *= abMultiplierPerFrq;
+        tmp4 *= abMultiplierPerFrq;
+    }
+    float tmp5 = std::sqrt(tmp3 * tmp3 + tmp4 * tmp4) * params.ab_multiplier;
+
+    // invalid pixel because zmultiplier < 0 ??
+    tmp3 = cond0 ? tmp3 : 0;
+    tmp4 = cond0 ? tmp4 : 0;
+    tmp5 = cond0 ? tmp5 : 0;
+
+    // invalid pixel because saturated?
+    tmp3 = !cond1 ? tmp3 : 0;
+    tmp4 = !cond1 ? tmp4 : 0;
+    tmp5 = !cond1 ? tmp5 : 65535.0; // some kind of norm calculated from tmp3 and tmp4
+
+    m_out[0] = tmp3; // ir image a
+    m_out[1] = tmp4; // ir image b
+    m_out[2] = tmp5; // ir amplitude
+    
+    /*
+    // Store a-image, b-image, amplitude
+    if (layer==0){
+    	abA_image0[x*424+y][0] = tmp3; // a
+    	abA_image0[x*424+y][1] = tmp4; // b
+    	abA_image0[x*424+y][2] = tmp5; // amplitude
+    }
+    else if (layer==1){
+    	abA_image1[x*424+y][0] = tmp3; // a
+    	abA_image1[x*424+y][1] = tmp4; // b
+    	abA_image1[x*424+y][2] = tmp5; // amplitude
+    }
+    else if (layer==2){
+    	abA_image2[x*424+y][0] = tmp3; // a
+    	abA_image2[x*424+y][1] = tmp4; // b
+    	abA_image2[x*424+y][2] = tmp5; // amplitude
+    }
+    // */
   }
 
   /**
@@ -490,10 +630,40 @@ public:
     m2_raw[0] = decodePixelMeasurement(data, 6, x, y);
     m2_raw[1] = decodePixelMeasurement(data, 7, x, y);
     m2_raw[2] = decodePixelMeasurement(data, 8, x, y);
-
+    
+    // Store raw images, 512*424
+    /*
+    raw_image0[x*424+y][0] += m0_raw[0];
+    raw_image0[x*424+y][1] += m0_raw[1];
+    raw_image0[x*424+y][2] += m0_raw[2];
+    raw_image1[x*424+y][0] += m1_raw[0];
+    raw_image1[x*424+y][1] += m1_raw[1];
+    raw_image1[x*424+y][2] += m1_raw[2];
+    raw_image2[x*424+y][0] += m2_raw[0];
+    raw_image2[x*424+y][1] += m2_raw[1];
+    raw_image2[x*424+y][2] += m2_raw[2];
+    // */
+//
+//    processMeasurementTriple(trig_table0, params.ab_multiplier_per_frq[0], x, y, m0_raw, m0_out, 0);
+//    processMeasurementTriple(trig_table1, params.ab_multiplier_per_frq[1], x, y, m1_raw, m1_out, 1);
+//    processMeasurementTriple(trig_table2, params.ab_multiplier_per_frq[2], x, y, m2_raw, m2_out, 2);
+    
     processMeasurementTriple(trig_table0, params.ab_multiplier_per_frq[0], x, y, m0_raw, m0_out);
     processMeasurementTriple(trig_table1, params.ab_multiplier_per_frq[1], x, y, m1_raw, m1_out);
     processMeasurementTriple(trig_table2, params.ab_multiplier_per_frq[2], x, y, m2_raw, m2_out);
+
+//    // abA images are added at filterPixelStage1.
+//    abA_image0[x*424+y][0] = m0_out[0]; // a
+//    abA_image0[x*424+y][1] = m0_out[1]; // b
+//    abA_image0[x*424+y][2] = m0_out[2]; // amplitude
+//    abA_image1[x*424+y][0] = m1_out[0]; // a
+//    abA_image1[x*424+y][1] = m1_out[1]; // b
+//    abA_image1[x*424+y][2] = m1_out[2]; // amplitude
+//    abA_image2[x*424+y][0] = m2_out[0]; // a
+//    abA_image2[x*424+y][1] = m2_out[1]; // b
+//    abA_image2[x*424+y][2] = m2_out[2]; // amplitude*/
+//    
+
   }
 
   /**
@@ -592,6 +762,25 @@ public:
         m_out[0] = 0.0f < weight_acc ? weighted_m_acc[0] / weight_acc : 0.0f;
         m_out[1] = 0.0f < weight_acc ? weighted_m_acc[1] / weight_acc : 0.0f;
         m_out[2] = m_ptr[2];
+        
+        /*
+        // Store a-image, b-image, amplitude
+        if (i==0){
+        	abA_image0[x*424+y][0] += m_out[0]; // a
+        	abA_image0[x*424+y][1] += m_out[1]; // b
+        	abA_image0[x*424+y][2] += m_out[2]; // amplitude
+        }
+        else if (i==1){
+        	abA_image1[x*424+y][0] += m_out[0]; // a
+        	abA_image1[x*424+y][1] += m_out[1]; // b
+        	abA_image1[x*424+y][2] += m_out[2]; // amplitude
+        }
+        else if (i==2){
+        	abA_image2[x*424+y][0] += m_out[0]; // a
+        	abA_image2[x*424+y][1] += m_out[1]; // b
+        	abA_image2[x*424+y][2] += m_out[2]; // amplitude
+        }
+        // */
       }
     }
   }
@@ -610,6 +799,12 @@ public:
     transformMeasurements(m0);
     transformMeasurements(m1);
     transformMeasurements(m2);
+    phase_image[x*424 + y][0] = m0[0];
+    phase_image[x*424 + y][1] = m1[0];
+    phase_image[x*424 + y][2] = m2[0];
+    ir_amp_image[x*424 + y][0] = m0[1];
+    ir_amp_image[x*424 + y][1] = m1[1];
+    ir_amp_image[x*424 + y][2] = m2[1];
 
     float ir_sum = m0[1] + m1[1] + m2[1];
 
@@ -739,6 +934,21 @@ public:
     //ir_out[0] = std::min(m0[2] * ab_output_multiplier, 65535.0f);
     //ir_out[1] = std::min(m1[2] * ab_output_multiplier, 65535.0f);
     //ir_out[2] = std::min(m2[2] * ab_output_multiplier, 65535.0f);
+    
+    phase_image[x*424+y][3] = phase;
+    ir_amp_image[x*424+y][3] = ir_sum;
+    depth_image[x*424+y][0] = depth;
+    
+    if (x == 512 - roi_x){
+    	ir_sum = *ir_out = *ir_sum_out = 65535;
+    }else if (x == 512 - roi_x - roi_w){
+    	ir_sum = *ir_out = *ir_sum_out = 65535;    	
+    }
+    if (y == 424 - roi_y){
+    	ir_sum = *ir_out = *ir_sum_out = 65535;
+    }else if (y == 424 - roi_y - roi_h){
+    	ir_sum = *ir_out = *ir_sum_out = 65535;    	
+    }
   }
 
   void filterPixelStage2(int x, int y, Mat<Vec<float, 3> > &m, bool max_edge_test_ok, float *depth_out)
@@ -819,6 +1029,201 @@ public:
 
     // override raw depth
     depth_and_ir_sum.val[0] = depth_and_ir_sum.val[1];
+    
+    depth_image[x*424+y][1] = *depth_out;
+  }
+  
+  void save_image(const char* filename){
+	  ofstream fout;
+	  fout.open(filename, ios::out | ios::binary | ios::trunc);
+	  if(!fout){
+		  cout << "ERROR: Cannot create " << filename << endl;
+		  return;
+	  }
+	  for (int i=0; i<512*424; i++){
+		  fout.write((char*) &tmp_image[i], sizeof(double));
+	  }
+	  fout.close();
+  }
+  
+  void save_image(const char*filename, int*data, int offset, int skip){	  
+//	  ofstream fout;
+//	  fout.open(filename, ios::out | ios::binary | ios::trunc);
+//	  if(!fout){
+//		  cout << "ERROR: Cannot create " << filename << endl;
+//		  return;
+//	  }
+//	  for (int i=0; i<512*424; i++){
+//		  fout.write((char*) &data[i*skip+offset], sizeof(int));
+//	  }
+//	  fout.close();
+	  for (int i=0; i<512*424; i++){
+		  tmp_image[i] = ((double)data[i*skip+offset]) / (double) accumulate_frames;
+	  }
+	  save_image(filename);
+  }
+  void save_image(const char*filename, double*data, int offset, int skip){	  
+//	  ofstream fout;
+//	  fout.open(filename, ios::out | ios::binary | ios::trunc);
+//	  if(!fout){
+//		  cout << "ERROR: Cannot create " << filename << endl;
+//		  return;
+//	  }
+//	  for (int i=0; i<512*424; i++){
+//		  fout.write((char*) &data[i*skip+offset], sizeof(double));
+//	  }
+//	  fout.close();
+	  for (int i=0; i<512*424; i++){
+		  tmp_image[i] = data[i*skip+offset] / (double) accumulate_frames;
+	  }
+	  save_image(filename);
+  }
+
+  void reset_capture(){
+
+	  cout << "### Reset. ###" << endl;
+	  accumulate_frames = 0;
+	  for (int i = 0; i < num_of_depth_bins; i++){
+		  phase_data_d[i][0] = 0;
+		  phase_data_d[i][1] = 0;
+		  phase_data_d[i][2] = 0;
+
+#ifdef SAVE_AMPLITUDE
+		  amp_data_d[i][0] = 0;
+		  amp_data_d[i][1] = 0;
+		  amp_data_d[i][2] = 0;
+#endif
+		  accumulate_data_d[i] = 0;
+	  }
+  }
+  
+  int accumulate_depth_wise(){
+	  double d, tmp;
+	  int index;
+	  int valid_depth_count = 0;
+	  for (int x = 512-roi_x; x > 512-roi_x-roi_w; x--){
+		  for (int y = 424-roi_y; y>424-roi_y-roi_h; y--){
+			  if (y>214 && y % 2 == 0) continue;
+			  if (y<210 && y % 2 == 1) continue;
+			  //cout << x << " " << y << endl;
+			  d = depth_image[x*424+y][1];
+			  if (d < start_depth) {
+				  if (d > reset_depth_near) valid_depth_count++;
+				  continue;
+			  }
+			  if (d > end_depth) {
+				  if (d < reset_depth_far) valid_depth_count++;
+				  continue;
+			  }
+			  index = (int)((d - start_depth) * num_of_depth_bins / (end_depth - start_depth));
+			  phase_data_d[index][0] += phase_image[x*424+y][0];
+			  phase_data_d[index][1] += phase_image[x*424+y][1];
+			  phase_data_d[index][2] += phase_image[x*424+y][2];
+#ifdef SAVE_AMPLITUDE
+			  amp_data_d[index][0] += ir_amp_image[x*424+y][0];
+			  amp_data_d[index][1] += ir_amp_image[x*424+y][1];
+			  amp_data_d[index][2] += ir_amp_image[x*424+y][2];
+#endif
+			  accumulate_data_d[index] += 1.; 
+			  valid_depth_count++;
+		  }
+	  }
+	  return valid_depth_count;
+  }
+  
+  void save_list_data(const char*filename, double*data){
+	  ofstream fout;
+	  fout.open(filename, ios::out | ios::binary | ios::trunc);
+	  if(!fout){
+		  cout << "ERROR: Cannot create " << filename << endl;
+		  return;
+	  }
+	  for (int i=0; i<num_of_depth_bins; i++){
+		  fout.write((char*) &data[i], sizeof(double));
+	  }
+	  fout.close();
+  }
+  
+  void save_list_data_ave(const char*filename, double*data, int offset, int skip){
+	  for (int i=0; i<num_of_depth_bins; i++){
+		  if (accumulate_data_d[i] > 0){
+			  temp_data_d[i] = data[i*skip+offset] / accumulate_data_d[i];
+		  }else{
+			  temp_data_d[i] = 0;
+		  }
+	  }
+	  save_list_data(filename, temp_data_d);
+  }
+    
+  void save_depth_wise(){
+	  save_list_data_ave("phase_depth_0.dat", (double*)phase_data_d, 0, 3);
+	  save_list_data_ave("phase_depth_1.dat", (double*)phase_data_d, 1, 3);
+	  save_list_data_ave("phase_depth_2.dat", (double*)phase_data_d, 2, 3);
+
+#ifdef SAVE_AMPLITUDE
+	  save_list_data_ave("amp_depth_0.dat", (double*)amp_data_d, 0, 3);
+	  save_list_data_ave("amp_depth_1.dat", (double*)amp_data_d, 1, 3);
+	  save_list_data_ave("amp_depth_2.dat", (double*)amp_data_d, 2, 3);
+#endif
+	  //save_list_data("depth_bins.dat", (double*)depth_data_d);
+	  save_list_data("accumurate_depth.dat", (double*)accumulate_data_d);
+  }
+
+  void save_all_images(){
+	  int valid_depth_count = accumulate_depth_wise();
+	  if (valid_depth_count == 0) {
+		  if (accumulate_frames > 0){
+			  reset_capture();
+			  save_depth_wise();			  
+		  }
+		  return;
+	  }
+	  if (accumulate_frames++ %  20 > 0){
+		  // cout << "  Save skipped." << endl;
+		  return;
+	  } // */
+	  //cout << "Frames: " << accumulate_frames << endl;
+	  cout << "### Saved. ###" << endl;
+	  accumulate_frames = 1;
+	  
+	  save_depth_wise();
+	  /* skip unused images. When other images are needed, uncomment this block.
+	  // Each image requires about 1.7MB storage.
+	  save_image("raw0.dat", (int*)raw_image0, 0, 3);
+	  save_image("raw1.dat", (int*)raw_image0, 1, 3);
+	  save_image("raw2.dat", (int*)raw_image0, 2, 3);
+	  save_image("raw3.dat", (int*)raw_image1, 0, 3);
+	  save_image("raw4.dat", (int*)raw_image1, 1, 3);
+	  save_image("raw5.dat", (int*)raw_image1, 2, 3);
+	  save_image("raw6.dat", (int*)raw_image2, 0, 3);
+	  save_image("raw7.dat", (int*)raw_image2, 1, 3);
+	  save_image("raw8.dat", (int*)raw_image2, 2, 3);
+	  
+	  save_image("phase_a0.dat", (double*)abA_image0, 0, 3);
+	  save_image("phase_b0.dat", (double*)abA_image0, 1, 3);
+	  save_image("amplitude0.dat", (double*)abA_image0, 2, 3);
+	  save_image("phase_a1.dat", (double*)abA_image1, 0, 3);
+	  save_image("phase_b1.dat", (double*)abA_image1, 1, 3);
+	  save_image("amplitude1.dat", (double*)abA_image1, 2, 3);
+	  save_image("phase_a2.dat", (double*)abA_image2, 0, 3);
+	  save_image("phase_b2.dat", (double*)abA_image2, 1, 3);
+	  save_image("amplitude2.dat", (double*)abA_image2, 2, 3);
+	  // 
+	  
+	  save_image("phase0.dat", (double*)phase_image, 0, 4);
+	  save_image("phase1.dat", (double*)phase_image, 1, 4);
+	  save_image("phase2.dat", (double*)phase_image, 2, 4);
+	  save_image("phase_full.dat", (double*)phase_image, 3, 4);
+	  save_image("f_amplitude0.dat", (double*)ir_amp_image, 0, 4);
+	  save_image("f_amplitude1.dat", (double*)ir_amp_image, 1, 4);
+	  save_image("f_amplitude2.dat", (double*)ir_amp_image, 2, 4);
+	  */
+	  // save_image("f_amplitude_full.dat", (double*)ir_amp_image, 3, 4);
+	  
+	  //save_image("depth_raw.dat", (double*)depth_image, 0, 2);
+	  // save_image("depth_out.dat", (double*)depth_image, 1, 2);
+	  
+	  // exit(1);
   }
 };
 
@@ -891,6 +1296,7 @@ void CpuDepthPacketProcessor::loadLookupTable(const short *lut)
   std::copy(lut, lut + LUT_SIZE, impl_->lut11to16);
 }
 
+
 /**
  * Process a packet.
  * @param packet Packet to process.
@@ -913,19 +1319,54 @@ void CpuDepthPacketProcessor::process(const DepthPacket &packet)
   Mat<unsigned char> m_max_edge_test(424, 512);
 
   float *m_ptr = (m.ptr(0, 0)->val);
-
+  
+#ifdef _OPENMP
+  int max_threads = omp_get_max_threads();
+  int ptr_num_per_thread9 = 424*512*9 / max_threads;
+  int ptr_num_per_thread = 424*512 / max_threads;
+  #pragma omp parallel
+  {
+	  //int thread_num = omp_get_thread_num();
+	  // usleep(duration_cast<microsecond>(10ms).count());
+	  float* mp_ptr = m_ptr + ptr_num_per_thread9 * omp_get_thread_num();
+      #pragma omp for
+	  for(int y = 0; y < 424; ++y){
+		for(int x = 0; x < 512; ++x, mp_ptr += 9)
+		{
+		  impl_->processPixelStage1(x, y, packet.buffer, mp_ptr + 0, mp_ptr + 3, mp_ptr + 6);
+		}
+	  }
+//  } // 
+#else
   for(int y = 0; y < 424; ++y)
-    for(int x = 0; x < 512; ++x, m_ptr += 9)
-    {
-      impl_->processPixelStage1(x, y, packet.buffer, m_ptr + 0, m_ptr + 3, m_ptr + 6);
-    }
-
+	for(int x = 0; x < 512; ++x, m_ptr += 9)
+	{
+	  impl_->processPixelStage1(x, y, packet.buffer, m_ptr + 0, m_ptr + 3, m_ptr + 6);
+	}
+#endif
+  
+  
   // bilateral filtering
   if(impl_->enable_bilateral_filter)
   {
     float *m_filtered_ptr = (m_filtered.ptr(0, 0)->val);
     unsigned char *m_max_edge_test_ptr = m_max_edge_test.ptr(0, 0);
 
+#ifdef _OPENMP
+//  #pragma omp parallel
+//  {
+    	float* mp_filtered_ptr = m_filtered_ptr + ptr_num_per_thread9 * omp_get_thread_num();
+    	unsigned char* mp_max_edge_test_ptr = m_max_edge_test_ptr + ptr_num_per_thread * omp_get_thread_num();
+		#pragma omp for
+        for(int y = 0; y < 424; ++y)
+          for(int x = 0; x < 512; ++x, mp_filtered_ptr += 9, ++mp_max_edge_test_ptr)
+          {
+            bool max_edge_test_val = true;
+            impl_->filterPixelStage1(x, y, m, mp_filtered_ptr, max_edge_test_val);
+            *mp_max_edge_test_ptr = max_edge_test_val ? 1 : 0;
+          }
+//  }
+#else
     for(int y = 0; y < 424; ++y)
       for(int x = 0; x < 512; ++x, m_filtered_ptr += 9, ++m_max_edge_test_ptr)
       {
@@ -933,6 +1374,7 @@ void CpuDepthPacketProcessor::process(const DepthPacket &packet)
         impl_->filterPixelStage1(x, y, m, m_filtered_ptr, max_edge_test_val);
         *m_max_edge_test_ptr = max_edge_test_val ? 1 : 0;
       }
+#endif
 
     m_ptr = (m_filtered.ptr(0, 0)->val);
   }
@@ -949,6 +1391,27 @@ void CpuDepthPacketProcessor::process(const DepthPacket &packet)
     Vec<float, 3> *depth_ir_sum_ptr = depth_ir_sum.ptr(0, 0);
     unsigned char *m_max_edge_test_ptr = m_max_edge_test.ptr(0, 0);
 
+#ifdef _OPENMP
+//    #pragma omp parallel
+//    {
+		unsigned char* mp_max_edge_test_ptr = m_max_edge_test_ptr + ptr_num_per_thread * omp_get_thread_num();
+		Vec<float, 3> *mp_depth_ir_sum_ptr = depth_ir_sum_ptr + ptr_num_per_thread * omp_get_thread_num();
+//		float *mp_ptr = m_ptr + ptr_num_per_thread9 * omp_get_thread_num();
+		mp_ptr = m_ptr + ptr_num_per_thread9 * omp_get_thread_num();
+		#pragma omp for
+		for(int y = 0; y < 424; ++y)
+		  for(int x = 0; x < 512; ++x, mp_ptr += 9, ++mp_max_edge_test_ptr, ++mp_depth_ir_sum_ptr)
+		  {
+			float raw_depth, ir_sum;
+	
+			impl_->processPixelStage2(x, y, mp_ptr + 0, mp_ptr + 3, mp_ptr + 6, out_ir.ptr(423 - y, x), &raw_depth, &ir_sum);
+	
+			mp_depth_ir_sum_ptr->val[0] = raw_depth;
+			mp_depth_ir_sum_ptr->val[1] = *mp_max_edge_test_ptr == 1 ? raw_depth : 0;
+			mp_depth_ir_sum_ptr->val[2] = ir_sum;
+		  }
+//    }
+#else
     for(int y = 0; y < 424; ++y)
       for(int x = 0; x < 512; ++x, m_ptr += 9, ++m_max_edge_test_ptr, ++depth_ir_sum_ptr)
       {
@@ -960,14 +1423,30 @@ void CpuDepthPacketProcessor::process(const DepthPacket &packet)
         depth_ir_sum_ptr->val[1] = *m_max_edge_test_ptr == 1 ? raw_depth : 0;
         depth_ir_sum_ptr->val[2] = ir_sum;
       }
+    
+#endif
 
     m_max_edge_test_ptr = m_max_edge_test.ptr(0, 0);
 
+#ifdef _OPENMP
+//    #pragma omp parallel
+//    {
+//    	unsigned char* mp_max_edge_test_ptr = m_max_edge_test_ptr + ptr_num_per_thread * omp_get_thread_num();
+    	mp_max_edge_test_ptr = m_max_edge_test_ptr + ptr_num_per_thread * omp_get_thread_num();
+        #pragma omp for
+		for(int y = 0; y < 424; ++y)
+		  for(int x = 0; x < 512; ++x, ++mp_max_edge_test_ptr)
+		  {
+			impl_->filterPixelStage2(x, y, depth_ir_sum, *mp_max_edge_test_ptr == 1, out_depth.ptr(423 - y, x));
+		  }
+//    }
+#else
     for(int y = 0; y < 424; ++y)
       for(int x = 0; x < 512; ++x, ++m_max_edge_test_ptr)
       {
         impl_->filterPixelStage2(x, y, depth_ir_sum, *m_max_edge_test_ptr == 1, out_depth.ptr(423 - y, x));
       }
+#endif
   }
   else
   {
@@ -978,6 +1457,11 @@ void CpuDepthPacketProcessor::process(const DepthPacket &packet)
       }
   }
 
+#ifdef _OPENMP
+  } // close parallel threads.
+#endif
+  // Save 9 raw images, 3 a images, 3 b images, and 3 amplitude images.
+  impl_->save_all_images();
   impl_->stopTiming(LOG_INFO);
 
   if (listener_ != 0 ){
