@@ -6,7 +6,7 @@ Altered driver for Kinect for Windows v2 and Xbox One devices so that amplitude 
 ## Requirements
 Requirements are the same as the [original libfreenect2](https://github.com/OpenKinect/libfreenect2). Please confirm that the build and run propery work on your computer using the original version. 
 
-Note: This commit and the former commit, labeled 'original', are not modified except the README.
+Note: Source codes in the 'master' branch are not modified except for the README.
 
 ## Extract amplitude and phase of each frequency
 
@@ -31,7 +31,7 @@ To convert binary file to images, `tools/dat2png.py` will work.
 Note: our environment was Ubuntu Desktop 14.04.3 and python 2.7.6.
 
 #### Other branches
-We provide other branches below. Please not that souce codes are not organized and README is not provided yet. We cannot provide any support regarding these branches.
+We provide other branches below. Please note that souce codes in these branches are not organized and README is not provided yet. We cannot provide any support regarding these branches.
 * `demo`:
  The real time demo app. Database is also provided, but it is device-dependent. The accuracy is not guaranteed.
 * `stage_sync`:
